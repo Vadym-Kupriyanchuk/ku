@@ -54,6 +54,7 @@ ku --resource deploy     # start on a resource type
 ku --theme tokyonight    # switch theme
 ku --edit                # start in edit mode (default is read-only)
 ku --dev                 # developer view, app resources only
+ku --as system:admin     # act as another identity
 ku upgrade               # replace the current binary with the latest release
 ```
 
@@ -89,10 +90,30 @@ ku --dev --edit          # edit mode, developer view
 Disabled keys are dropped from the footer hints and the command palette, and `?`
 summarizes the active mode.
 
+## Impersonation
+
+`--as`, `--as-group` and `--as-uid` work like their kubectl counterparts. Every
+call in the session acts as that identity, which is the way to reach objects
+your own kubeconfig user may not touch.
+
+```
+ku --edit --as system:admin
+ku --edit --as system:admin --as-group system:masters
+```
+
+`--as-group` is repeatable. Groups and a uid need a user, so `--as-group` on its
+own is rejected before the session starts.
+
+The header shows an `as` chip while impersonation is active. Impersonation is
+per-invocation: it is never written to
+`state.json`, so the next launch is back to your own identity. It also does not
+relax the read-only default, so writes still need `--edit` or `Shift+E`.
+
 ## Configuration
 
 `ku` reads an optional config file from `~/.config/ku/config.yaml` for sidebar
-customization and stores session state in `~/.config/ku/state.json`.
+customization and plugin shortcuts, and stores session state in
+`~/.config/ku/state.json`.
 
 ### Add custom resources (CRDs) to the sidebar
 
@@ -120,6 +141,25 @@ sidebar:
 Restart `ku` to apply the change. Resources your cluster does not expose are
 dropped, and empty sections are hidden.
 
+### Plugins
+
+Bind a key to an external command. The command gets the selected row as
+`$NAMESPACE`, `$NAME`, `$RESOURCE`, `$CONTEXT` and `$CLUSTER`, both expanded in
+`args` and exported to its environment:
+
+```yaml
+plugins:
+  - key: ctrl+o
+    desc: open dashboard
+    scopes: [pods, deployments]
+    command: open
+    args: ["https://dashboard.example.com/$CLUSTER/$NAMESPACE/$RESOURCE/$NAME"]
+    background: true
+```
+
+Without `background: true` the command runs in the embedded terminal. Plugins
+show in the footer, the palette and `?` for the resources they are scoped to.
+
 See [Configuration](docs/configuration.md) for the full reference.
 
 ## Highlights
@@ -130,6 +170,7 @@ See [Configuration](docs/configuration.md) for the full reference.
 - Config summaries, raw YAML, logs, Service port-forward, edit-in-editor, shell into pods or nodes, delete, scale, restart, and CronJob trigger, all inside the TUI.
 - ANSI colors that match your terminal in light or dark mode, with Tokyo Night as a fallback (`--theme tokyonight`).
 - A customizable sidebar menu via an optional config file (`ku config init`): add CRDs like HPAs, KEDA ScaledObjects, or OpenTelemetry collectors.
+- Plugins: bind a key to any external command with the selected row's namespace, name, resource, context and cluster, detached or in the embedded terminal.
 - `C` shows the equivalent `kubectl` command, and `O` opens upstream Kubernetes docs for known resources.
 - Remembers your last context and namespace.
 

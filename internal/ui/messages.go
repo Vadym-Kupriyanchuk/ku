@@ -154,10 +154,12 @@ type crdsDiscoveredMsg struct {
 // startupReadyMsg carries the result of connecting to the cluster and loading
 // the config in the background while the splash screen shows.
 type startupReadyMsg struct {
-	client  *k8s.Client
-	catalog []navCatGroup
-	cfgErr  error
-	err     error
+	client         *k8s.Client
+	catalog        []navCatGroup
+	plugins        []plugin
+	pluginWarnings []string
+	cfgErr         error
+	err            error
 }
 
 // updateAvailableMsg carries a newer release tag found by the background update
@@ -173,27 +175,30 @@ func opCtx() (context.Context, context.CancelFunc) {
 // startupCmd connects to the cluster and resolves the sidebar catalog off the
 // UI thread so the splash can animate. Flags take precedence over the
 // remembered context; a stale remembered context falls back to the default.
-func startupCmd(opts Options, saved savedState, hasSaved bool) tea.Cmd {
+func startupCmd(opts Options, saved savedState, hasSaved bool, keys keyMap) tea.Cmd {
 	return func() tea.Msg {
 		ctxName := opts.Context
 		if ctxName == "" && hasSaved {
 			ctxName = saved.Context
 		}
-		cl, err := k8s.NewClient(ctxName, opts.Kubeconfig)
+		cl, err := k8s.NewClient(ctxName, opts.Kubeconfig, opts.Impersonate)
 		if err != nil && opts.Context == "" && ctxName != "" {
-			cl, err = k8s.NewClient("", opts.Kubeconfig)
+			cl, err = k8s.NewClient("", opts.Kubeconfig, opts.Impersonate)
 		}
 		if err != nil {
 			return startupReadyMsg{err: err}
 		}
 		catalog := defaultNavCatalog()
+		var plugins []plugin
+		var warnings []string
 		cfg, found, cfgErr := loadConfig()
 		if found {
 			if c := cfg.sidebarCatalog(); len(c) > 0 {
 				catalog = c
 			}
+			plugins, warnings = cfg.pluginCatalog(keys)
 		}
-		return startupReadyMsg{client: cl, catalog: catalog, cfgErr: cfgErr}
+		return startupReadyMsg{client: cl, catalog: catalog, plugins: plugins, pluginWarnings: warnings, cfgErr: cfgErr}
 	}
 }
 
@@ -463,9 +468,12 @@ func drainCmd(cl *k8s.Client, name string) tea.Cmd {
 	}
 }
 
-func switchContextCmd(name, kubeconfig string) tea.Cmd {
+// switchContextCmd rebuilds the client for another context. It carries the
+// impersonation forward, so switching context does not silently drop the
+// identity the session was started with.
+func switchContextCmd(name, kubeconfig string, imp k8s.Impersonation) tea.Cmd {
 	return func() tea.Msg {
-		cl, err := k8s.NewClient(name, kubeconfig)
+		cl, err := k8s.NewClient(name, kubeconfig, imp)
 		return clientReadyMsg{client: cl, err: err}
 	}
 }

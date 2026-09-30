@@ -11,7 +11,7 @@ can run any of these and jump to any resource.
 | `g` / `G` | top / bottom |
 | `Ctrl+u` / `Ctrl+d` | half page up / down |
 | `PgUp` / `PgDn` | page up / down |
-| `Tab` | switch pane (nav / table) |
+| `Tab` | switch pane (nav / table); the nav is focused at startup |
 | `Left` / `h` | focus the nav from the table |
 | `Right` / `l` | open the selected nav entry while the nav is focused |
 
@@ -45,6 +45,11 @@ in read-only mode; unscheduled pods show a status message instead.
 namespaces (a server-side `spec.nodeName` field selector, shown as a `node`
 chip in the header). `esc` drops the scope; switching resource or context also
 clears it. Works in read-only mode.
+
+Plugins from `~/.config/ku/config.yaml` add their own keys to this table for the
+resources they are scoped to. They show in the footer, the palette and `?`, and
+they cannot take a key listed on this page. See
+[Configuration](configuration.md#plugins).
 
 Draining cordons the node, then evicts its pods through the eviction API so
 PodDisruptionBudgets are honored. DaemonSet and static (mirror) pods are left in

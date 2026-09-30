@@ -33,6 +33,7 @@ ku -n kube-system        # start in a namespace
 ku --resource deploy     # start on a resource type
 ku --theme tokyonight    # use the Tokyo Night theme
 ku --check               # read-only connectivity check, no UI
+ku --edit --as system:admin   # act as another identity
 ku --version
 ```
 
@@ -55,6 +56,11 @@ ku --version
 | `-n`, `--namespace` | initial namespace; omit to use the remembered or context namespace |
 | `--resource` | initial resource, e.g. `pods`, `deploy`, `svc` |
 | `--theme` | `ansi` (default) or a built-in theme, e.g. `dracula`, `gruvbox`, `catppuccin` (see Themes) |
+| `--as` | username to impersonate for the session, e.g. `system:admin` |
+| `--as-group` | group to impersonate; repeat the flag for multiple groups |
+| `--as-uid` | uid to impersonate |
+| `--dev` | developer view: hide cluster admin resources and node ops |
+| `--edit` | start in edit mode; the default is read-only |
 | `--check` | run a read-only connectivity check and exit |
 | `--version` | print version and exit |
 
@@ -73,9 +79,9 @@ deployments, and recent warnings). From there:
 - A status bar always shows the keys available right now, with the creator
   handle in the bottom-right.
 
-Press `Tab` to move focus between the nav and the main area, `Enter` on a nav
-entry to open it, and the Overview entry to return to the cockpit. The focused
-pane has a highlighted border.
+The nav starts focused. Press `Tab` to move focus between the nav and the main
+area, `Enter` on a nav entry to open it, and the Overview entry to return to the
+cockpit. The focused pane has a highlighted border.
 
 ## Themes
 
@@ -92,11 +98,17 @@ place; the choice is remembered for the next launch, unless `--theme` or
 
 ## Configuration
 
-ku reads optional sidebar config from `~/.config/ku/config.yaml`. Use
-`ku config init` to seed a starter file, then restart the TUI after edits.
+ku reads optional sidebar and plugin config from `~/.config/ku/config.yaml`.
+Use `ku config init` to seed a starter file, then restart the TUI after edits.
 
 See [Configuration](configuration.md) for file paths, sidebar examples,
-resource names, and opt-in resources.
+resource names, opt-in resources, and plugin shortcuts.
+
+## Impersonation
+
+`--as`, `--as-group` and `--as-uid` work like their kubectl counterparts: every
+call in the session acts as that identity. See [Features](features.md) for
+details.
 
 ## Session memory
 

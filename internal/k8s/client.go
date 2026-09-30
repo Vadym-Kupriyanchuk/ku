@@ -14,6 +14,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
 // Client holds the connection to a single cluster/context. It is rebuilt from
@@ -21,6 +22,10 @@ import (
 type Client struct {
 	// ContextName is the kubeconfig context currently in use.
 	ContextName string
+	// ClusterName is the kubeconfig cluster the context points at. Plugins
+	// expose it as $CLUSTER, since contexts are often named differently from
+	// the clusters they target.
+	ClusterName string
 	// Host is the API server URL, shown in the header.
 	Host string
 	// Namespace is the default namespace declared by the context ("" if none).
@@ -42,9 +47,10 @@ type Client struct {
 // NewClient builds a client from the kubeconfig. kubeconfigPath, if non-empty,
 // overrides the default lookup ($KUBECONFIG, then ~/.kube/config). If
 // contextOverride is non-empty it selects that context instead of the
-// kubeconfig's current-context.
-func NewClient(contextOverride, kubeconfigPath string) (*Client, error) {
-	cc, restCfg, err := loadClientConfig(contextOverride, kubeconfigPath)
+// kubeconfig's current-context. A non-zero imp makes every call act as that
+// identity.
+func NewClient(contextOverride, kubeconfigPath string, imp Impersonation) (*Client, error) {
+	cc, restCfg, err := loadClientConfig(contextOverride, kubeconfigPath, imp)
 	if err != nil {
 		return nil, err
 	}
@@ -93,6 +99,7 @@ func NewClient(contextOverride, kubeconfigPath string) (*Client, error) {
 
 	c := &Client{
 		ContextName: ctxName,
+		ClusterName: clusterNameFor(raw, ctxName),
 		Host:        restCfg.Host,
 		Namespace:   ns,
 		restConfig:  restCfg,
@@ -116,12 +123,12 @@ func NewClient(contextOverride, kubeconfigPath string) (*Client, error) {
 
 // ValidateKubeconfig checks local kubeconfig loading without connecting to the
 // API server. It lets startup fail before the terminal UI sends feature probes.
-func ValidateKubeconfig(contextOverride, kubeconfigPath string) error {
-	_, _, err := loadClientConfig(contextOverride, kubeconfigPath)
+func ValidateKubeconfig(contextOverride, kubeconfigPath string, imp Impersonation) error {
+	_, _, err := loadClientConfig(contextOverride, kubeconfigPath, imp)
 	return err
 }
 
-func loadClientConfig(contextOverride, kubeconfigPath string) (clientcmd.ClientConfig, *rest.Config, error) {
+func loadClientConfig(contextOverride, kubeconfigPath string, imp Impersonation) (clientcmd.ClientConfig, *rest.Config, error) {
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
 	if kubeconfigPath != "" {
 		rules.ExplicitPath = kubeconfigPath
@@ -129,6 +136,14 @@ func loadClientConfig(contextOverride, kubeconfigPath string) (clientcmd.ClientC
 	overrides := &clientcmd.ConfigOverrides{}
 	if contextOverride != "" {
 		overrides.CurrentContext = contextOverride
+	}
+	// The same overrides kubectl binds --as, --as-group and --as-uid to. They
+	// become restCfg.Impersonate, which every client and transport built below
+	// inherits, so no call site needs to know about impersonation.
+	if imp.Active() {
+		overrides.AuthInfo.Impersonate = imp.User
+		overrides.AuthInfo.ImpersonateGroups = imp.Groups
+		overrides.AuthInfo.ImpersonateUID = imp.UID
 	}
 	cc := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides)
 
@@ -191,3 +206,13 @@ func (c *Client) Contexts() []string { return c.contexts }
 // Kubeconfig returns the explicit kubeconfig path in use ("" for the default),
 // so a context switch can reuse it.
 func (c *Client) Kubeconfig() string { return c.kubeconfig }
+
+// clusterNameFor returns the cluster the named context points at, or "" when
+// the kubeconfig has no such context.
+func clusterNameFor(raw clientcmdapi.Config, ctxName string) string {
+	ctx, ok := raw.Contexts[ctxName]
+	if !ok || ctx == nil {
+		return ""
+	}
+	return ctx.Cluster
+}

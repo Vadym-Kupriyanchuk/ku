@@ -72,10 +72,11 @@ type rowRef struct {
 
 // App is the root Bubble Tea model.
 type App struct {
-	client *k8s.Client
-	theme  Theme
-	keys   keyMap
-	navCat []navCatGroup // sidebar catalog (from config or built-in defaults)
+	client  *k8s.Client
+	theme   Theme
+	keys    keyMap
+	navCat  []navCatGroup // sidebar catalog (from config or built-in defaults)
+	plugins []plugin      // user shortcuts from config, matched against the current resource
 
 	crds     []k8s.ResourceInfo // CRDs surfaced by the sidebar discovery button
 	crdState crdState
@@ -149,6 +150,11 @@ type App struct {
 	// runtime from the command palette.
 	dev      bool
 	readOnly bool
+
+	// impersonate is the identity every cluster call acts as, from
+	// --as/--as-group/--as-uid. Set once at startup and never persisted; it
+	// changes who you are, not what edit mode allows.
+	impersonate k8s.Impersonation
 }
 
 func newSpinner(th Theme) spinner.Model {
@@ -211,8 +217,18 @@ func (a App) adoptStartup(m startupReadyMsg) (tea.Model, tea.Cmd) {
 	}
 	a.splash = false
 	a.connect(m.client, m.catalog)
+	// A fresh session starts with the sidebar focused, so the menu is one key
+	// away without pressing tab first. A terminal too narrow for the sidebar
+	// keeps focus on the main pane, and a --resource start lands on its table.
+	a.focus = focusSidebar
+	// connect rebuilds the help view, so the plugin column must be set after it.
+	a.plugins = m.plugins
+	a.help.extra = pluginHelpGroups(a.plugins)
 	if m.cfgErr != nil {
 		a.setStatus("config: "+m.cfgErr.Error()+"; using defaults", true)
+	}
+	if len(m.pluginWarnings) > 0 {
+		a.setStatus("config: "+strings.Join(m.pluginWarnings, "; "), true)
 	}
 	switch {
 	case a.opts.Namespace != "":
@@ -231,6 +247,9 @@ func (a App) adoptStartup(m startupReadyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	a.relayout()
+	if !a.sidebarVisible() {
+		a.focus = focusMain
+	}
 	a.loading = true // keep the spinner running through the first load
 	return a, tea.Batch(tickCmd(), a.loadCmd())
 }
@@ -239,7 +258,7 @@ func (a App) Init() tea.Cmd {
 	if a.splash {
 		// Animate the spinner while the cluster connection and config load run in
 		// the background. The update check runs alongside and never blocks startup.
-		return tea.Batch(a.spin.Tick, startupCmd(a.opts, a.saved, a.hasSaved), checkUpdateCmd(a.opts.Version))
+		return tea.Batch(a.spin.Tick, startupCmd(a.opts, a.saved, a.hasSaved, a.keys), checkUpdateCmd(a.opts.Version))
 	}
 	return tea.Batch(a.spin.Tick, tickCmd(), a.loadCmd())
 }
@@ -569,6 +588,9 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case statusMsg:
 		a.setStatus(m.text, m.err)
 		return a, nil
+
+	case pluginRunMsg:
+		return a.execPlugin(m.plugin, m.vars)
 
 	case editModeMsg:
 		a.readOnly = !m.edit
@@ -923,6 +945,11 @@ func (a App) updateMainKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, a.keys.Drain):
 		return a.openDrain()
 	default:
+		// Plugins come last so a built-in binding always wins; the catalog
+		// already refuses keys the built-ins use.
+		if p, ok := a.pluginForKey(msg); ok {
+			return a.runPlugin(p)
+		}
 		var cmd tea.Cmd
 		a.table, cmd = a.table.Update(msg)
 		return a, cmd
@@ -1792,6 +1819,26 @@ func (a App) editTarget(t target) (tea.Model, tea.Cmd) {
 // startEdit opens the object's YAML in $EDITOR (nvim) inside an embedded
 // terminal overlay. When the editor exits, the file is applied automatically.
 func (a App) startEdit(m editReadyMsg) (tea.Model, tea.Cmd) {
+	bin, args := editorCommand(m.path)
+	batch, err := a.startPTY("edit "+m.name, bin, args, append(os.Environ(), "TERM=xterm-256color"))
+	if err != nil {
+		os.Remove(m.path)
+		a.setStatus("edit: "+trimErr(err), true)
+		return a, nil
+	}
+	a.term.isEdit = true
+	a.term.editPath, a.term.editOriginal = m.path, m.original
+	a.term.editRes, a.term.editNs, a.term.editName = m.res, m.ns, m.name
+	a.term.editCl = m.client // capture: applying targets the cluster we read from
+	return a, batch
+}
+
+// startPTY runs a local program in a pseudo-terminal rendered by the terminal
+// overlay. It owns the emulator, the pty and the streaming goroutines shared by
+// the editor and plugin sessions; callers set any session-specific fields on
+// a.term afterwards. On error the previous session is already stopped and the
+// overlay is untouched.
+func (a *App) startPTY(title, bin string, args, env []string) (tea.Cmd, error) {
 	a.term.stop()
 	a.termSession++
 	sess := a.termSession
@@ -1801,16 +1848,13 @@ func (a App) startEdit(m editReadyMsg) (tea.Model, tea.Cmd) {
 	result := &termResult{done: make(chan struct{})}
 	input := make(chan termInput, 256)
 
-	bin, args := editorCommand(m.path)
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	cmd.Env = env
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})
 	if err != nil {
 		cancel()
-		os.Remove(m.path)
-		a.setStatus("edit: "+trimErr(err), true)
-		return a, nil
+		return nil, err
 	}
 
 	t := newTermView(a.theme)
@@ -1822,17 +1866,13 @@ func (a App) startEdit(m editReadyMsg) (tea.Model, tea.Cmd) {
 	t.input = input
 	t.session = sess
 	t.cols, t.rows = cols, rows
-	t.title = "edit " + m.name
-	t.isEdit = true
-	t.editPath, t.editOriginal = m.path, m.original
-	t.editRes, t.editNs, t.editName = m.res, m.ns, m.name
-	t.editCl = m.client // capture: applying targets the cluster we read from
+	t.title = title
 	a.term = t
 	a.overlay = overlayTerm
 
 	go runTermInput(ctx, em, input)
-	go func() { _, _ = io.Copy(ptmx, em) }() // keystrokes -> editor stdin
-	go func() { _, _ = io.Copy(em, ptmx) }() // editor output -> screen
+	go func() { _, _ = io.Copy(ptmx, em) }() // keystrokes -> program stdin
+	go func() { _, _ = io.Copy(em, ptmx) }() // program output -> screen
 	go func() {
 		err := cmd.Wait()
 		em.Close()
@@ -1841,7 +1881,7 @@ func (a App) startEdit(m editReadyMsg) (tea.Model, tea.Cmd) {
 		close(result.done)
 	}()
 
-	return a, tea.Batch(termTick(sess), waitTermDone(sess, result))
+	return tea.Batch(termTick(sess), waitTermDone(sess, result)), nil
 }
 
 // handleTermDone processes the end of an embedded session. Exec sessions show a
@@ -2239,6 +2279,12 @@ func (a App) openPalette() (tea.Model, tea.Cmd) {
 		if writes && a.res.IsCronJob() {
 			items = append(items, selItem{title: "Trigger job now", desc: "t", id: "act:trigger"})
 		}
+		reg := a.pluginRegistry()
+		for i, p := range a.plugins {
+			if p.matches(a.res, reg) {
+				items = append(items, selItem{title: p.desc, desc: p.key, id: "plugin:" + itoa(i)})
+			}
+		}
 	}
 
 	editModeItem := selItem{title: "Enter edit mode", desc: "read-only", id: "cmd:editmode"}
@@ -2381,7 +2427,7 @@ func (a App) applySelection(res selResult) (tea.Model, tea.Cmd) {
 		}
 		a.lookupSeq++
 		a.setStatus("switching context…", false)
-		return a, switchContextCmd(res.id, a.client.Kubeconfig())
+		return a, switchContextCmd(res.id, a.client.Kubeconfig(), a.impersonate)
 	case selContainer:
 		return a.startLogs(a.logTarget.ns, a.logTarget.name, res.id, a.logPrevious[res.id])
 	case selExecContainer:
@@ -2430,6 +2476,12 @@ func (a App) applyPalette(id string) (tea.Model, tea.Cmd) {
 	if res, ok := strings.CutPrefix(id, "res:"); ok {
 		if ri, ok := a.client.Registry().Resolve(res); ok {
 			return a.switchResource(ri)
+		}
+		return a, nil
+	}
+	if s, ok := strings.CutPrefix(id, "plugin:"); ok {
+		if i, err := strconv.Atoi(s); err == nil && i >= 0 && i < len(a.plugins) {
+			return a.runPlugin(a.plugins[i])
 		}
 		return a, nil
 	}
@@ -2681,6 +2733,11 @@ func (a App) headerView() string {
 	if a.dev {
 		chips = append(chips, chip("mode", "dev"))
 	}
+	// Warn-styled rather than a plain chip: every call in the session runs as
+	// someone else, which should never be easy to miss.
+	if a.impersonate.Active() {
+		chips = append(chips, th.HeaderKey.Render("as ")+th.Warn.Render(truncate(impersonationLabel(a.impersonate), 28)))
+	}
 	if n := len(a.portForwards); n > 0 {
 		chips = append(chips, chip("pf", itoa(n)))
 	}
@@ -2707,9 +2764,13 @@ func (a App) headerView() string {
 
 	avail := a.width - lipgloss.Width(right) - 2
 	left := logo
+	// Skip a chip that does not fit instead of stopping at it. The chips at the
+	// end (node scope, active filter) are the ones that keep a narrowed list from
+	// looking like the whole set, so a wide chip ahead of them must not take them
+	// down with it.
 	for _, c := range chips {
 		if lipgloss.Width(left)+2+lipgloss.Width(c) > avail {
-			break
+			continue
 		}
 		left += "  " + c
 	}
@@ -2925,6 +2986,9 @@ func (a App) hints() []hint {
 	}
 	if writes {
 		h = append(h, hint{"e", "edit"}, hint{"x", "del"}, hint{"X", "del all"})
+	}
+	for _, p := range a.activePlugins() {
+		h = append(h, hint{p.key, p.desc})
 	}
 	h = append(h,
 		editModeHint, hint{"/", "filter"}, hint{"S", "sort"}, hint{"O", "docs"}, hint{"C", "cmd"},
